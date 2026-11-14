@@ -1,0 +1,43 @@
+{
+  "built_at": "2026-11-14T19:29:03.030228Z",
+  "primary_source": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+  "cross_check_source": "https://www.spglobal.com/spdji/en/idsexport/file.xls?redesignExport=true&languageId=1&indexId=5479673",
+  "cross_check": {
+    "status": "spdji_export_unreachable_or_unparseable"
+  },
+  "count": 503,
+  "ranking": "market_cap_descending_at_snapshot_via_robinhood_fundamentals_batched_20_per_call",
+  "market_cap_missing_tickers_ranked_last": [],
+  "top5": [
+    {
+      "rank": 1,
+      "ticker": "AAPL",
+      "name": "Apple Inc.",
+      "sector": "Information Technology"
+    },
+    {
+      "rank": 2,
+      "ticker": "NVDA",
+      "name": "Nvidia",
+      "sector": "Information Technology"
+    },
+    {
+      "rank": 3,
+      "ticker": "MSFT",
+      "name": "Microsoft",
+      "sector": "Information Technology"
+    },
+    {
+      "rank": 4,
+      "ticker": "GOOGL",
+      "name": "Alphabet Inc. (Class A)",
+      "sector": "Communication Services"
+    },
+    {
+      "rank": 5,
+      "ticker": "GOOG",
+      "name": "Alphabet Inc. (Class C)",
+      "sector": "Communication Services"
+    }
+  ]
+}
