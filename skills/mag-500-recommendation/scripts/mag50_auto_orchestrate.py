@@ -11,7 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,34 @@ def raise_if_shutdown() -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
+def _prefetch_reuse_hours() -> float:
+    """D-13 (DEVIATIONS.md): MAG500_PREFETCH_REUSE_HOURS — resumable
+    valuation reuse window in hours. Unset/empty/0/invalid/negative =
+    0.0 (reuse off; pre-D-13 behaviour exactly)."""
+    try:
+        hours = float(os.environ.get('MAG500_PREFETCH_REUSE_HOURS', '') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return hours if hours > 0 else 0.0
+
+
+def _prefetch_cutoff() -> tuple[str, datetime | None]:
+    """(cutoff_iso, cutoff_dt) for the Phase 6 verify-mode children.
+
+    D-13: with reuse on, the MAG500_PREFETCH_CUTOFF handed to the
+    adapter children moves back by the reuse window, so records seeded
+    by an earlier (possibly interrupted) attempt count as fresh and
+    the children verify-and-exit instead of re-evaluating. With reuse
+    off the cutoff is the run start (now) and the returned datetime is
+    None, which keeps classify_refresh_result on its original
+    new-record proof."""
+    hours = _prefetch_reuse_hours()
+    if hours > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        return cutoff.isoformat().replace('+00:00', 'Z'), cutoff
+    return now_iso(), None
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -969,13 +997,36 @@ def classify_refresh_result(
     result: dict[str, Any],
     pre_run_id: str | None,
     verified_ref: dict[str, Any] | None,
+    reuse_cutoff: datetime | None = None,
 ) -> tuple[bool, str | None]:
+    updated = bool(
+        verified_ref
+        and verified_ref.get('run_id')
+        and verified_ref.get('run_id') != pre_run_id
+    )
+    reused = False
+    if (
+        reuse_cutoff is not None
+        and verified_ref
+        and verified_ref.get('run_id')
+        and verified_ref.get('run_id') == pre_run_id
+    ):
+        # D-13: in reuse mode the adapter child exits 0 in verify mode
+        # on a pre-seeded record, so the verified reference IS the
+        # pre-run record. The original new-record proof (run_id must
+        # differ) is replaced — only in this branch — by a freshness
+        # proof: the record's completion timestamp must lie inside the
+        # reuse window (at/after the same cutoff the child verified
+        # against). valid_reference below is still enforced, and with
+        # reuse_cutoff None this branch never fires.
+        ts = parse_dt(verified_ref.get('valuation_last_run_at'))
+        reused = ts is not None and ts >= reuse_cutoff
     success = bool(
         not result.get('timed_out')
         and result.get('exit_code') == 0
         and verified_ref
         and verified_ref.get('run_id')
-        and verified_ref.get('run_id') != pre_run_id
+        and (updated or reused)
         and valid_reference(verified_ref)
     )
     if result.get('timed_out'):
@@ -1046,6 +1097,45 @@ def build_record(row: dict[str, Any], market: dict[str, Any], ref: dict[str, Any
     rec['gav_code'] = gav
     rec['derived_score'] = _derived_from(bs, vs, gav)
     return rec
+
+
+def d14_unscored_eligible(refresh: dict[str, Any] | None) -> bool:
+    """D-14 gate: a refresh that ran and failed terminally (the engine's
+    fail-closed verdict — no usable 10-K, or Business/Value missing) may
+    become a structured unscored output row. A timed-out refresh may
+    not: a timeout is transient, not a verdict, and stays fail-closed.
+    A missing or successful refresh never reaches the unscored branch."""
+    return (
+        refresh is not None
+        and not refresh.get('success')
+        and refresh.get('error_code') != 'VALUATION_REFRESH_TIMEOUT'
+    )
+
+
+def build_unscored_record(row: dict[str, Any], market: dict[str, Any], reason: Any) -> dict[str, Any]:
+    """D-14: structured unscored output row — the build_record schema
+    with every score null, the fail-closed reason preserved, and an
+    explicit unscored marker (the D-17 pattern from the wheel). Never
+    ranked: derived_score is None and Top-10 selection requires a
+    number. Market fields still come from this run's market data."""
+    return {
+        'rank': row['rank'],
+        'ticker': row['ticker'],
+        'name': row['name'],
+        'sector': row['sector'],
+        'market_cap': fmt_cap(market.get('market_cap_raw')),
+        'current_price': market.get('current_price'),
+        'market_data_as_of': market.get('market_data_as_of'),
+        'business_quality': {'score': None, 'grade': None, 'confidence': None},
+        'valuation': {'score': None, 'grade': None, 'confidence': None},
+        'target_prices': None,
+        'run_id': None,
+        'valuation_last_run_at': None,
+        'gav_code': None,
+        'derived_score': None,
+        'unscored': True,
+        'unscored_reason': reason,
+    }
 
 
 def build_valuation_notification(record: dict[str, Any], reasons: list[str]) -> str:
@@ -1290,10 +1380,19 @@ def main() -> int:
     # notification, and rank-order assembly are exactly the copied
     # logic. A ticker whose prefetch failed is evaluated for real by
     # its child (a second, sequential chance).
+    # D-13: the in-process prefetch reads MAG500_PREFETCH_REUSE_HOURS
+    # from this process's environment itself (see valuation_adapter),
+    # so with reuse on it skips tickers whose valid history record is
+    # inside the window; the moved-back cutoff below then lets the
+    # Phase 6 children verify those same records as fresh.
+    reuse_cutoff_dt: datetime | None = None
     if VALUATION_WORKERS > 1 and plan:
         checkpoint_phase(scratch_obj, scratch, 'valuation_prefetch')
         VAL_ENV['MAG500_PREFETCHED'] = '1'
-        VAL_ENV['MAG500_PREFETCH_CUTOFF'] = now_iso()
+        # D-13: reuse on -> cutoff = now - window (pre-seeded records
+        # verify as fresh); reuse off -> cutoff = now (run start).
+        _cutoff_iso, reuse_cutoff_dt = _prefetch_cutoff()
+        VAL_ENV['MAG500_PREFETCH_CUTOFF'] = _cutoff_iso
         from scripts.valuation_adapter import prefetch_valuations as _prefetch
 
         def _prefetch_cb(_ticker: str, _diag: dict[str, Any]) -> None:
@@ -1420,6 +1519,7 @@ def main() -> int:
             result,
             item.get('previous_history_run_id'),
             verified_ref,
+            reuse_cutoff=reuse_cutoff_dt,
         )
         value = {
             'ticker': ticker,
@@ -1481,6 +1581,7 @@ def main() -> int:
     checkpoint_phase(scratch_obj, scratch, 'output_rebuild')
     final_records: list[dict[str, Any]] = []
     refresh_success_by_ticker = {x['ticker']: x for x in scratch_obj['valuation_refreshes'] if x.get('success')}
+    refresh_by_ticker = {x['ticker']: x for x in scratch_obj['valuation_refreshes']}
     for row in rows:
         ticker = row['ticker']
         market = market_by_ticker.get(ticker, {})
@@ -1507,7 +1608,19 @@ def main() -> int:
                 gav = safe_numeric(record.get('gav_code'))
             record['derived_score'] = _derived_from(bs, vs, gav)
         else:
-            raise RuntimeError(f'No valid record available for {ticker}')
+            # D-14: no valid reference and no prior output record. When
+            # this run's refresh failed terminally, emit a structured
+            # unscored row (reason preserved) instead of aborting the
+            # whole rebuild; otherwise stay fail-closed.
+            refresh = refresh_by_ticker.get(ticker)
+            if not d14_unscored_eligible(refresh):
+                raise RuntimeError(f'No valid record available for {ticker}')
+            reason = refresh.get('error_message') or refresh.get('error_code') or 'valuation_refresh_failed'
+            record = build_unscored_record(row, market, reason)
+            scratch_obj['events'].append({
+                'event': 'output_unscored_row', 'timestamp': now_iso(),
+                'ticker': ticker, 'rank': row['rank'], 'reason': reason,
+            })
         final_records.append(record)
 
     final_records.sort(key=lambda x: x['rank'])

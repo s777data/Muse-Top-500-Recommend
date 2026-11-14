@@ -116,3 +116,93 @@ Source: `s777data/options-wheel-agent` @ `0b0d64a7e2f90e41ffa406acac66bf42045f1c
   `TARGET_PRICES_INVALID`. The Final/derived score is unaffected —
   it never uses the DCF target (the Value leg's DCF sub-score is
   already renormalised inside the engine).
+- **D-13 Resumable valuation reuse (2026-11-14).** Motivation: two
+  full 503-ticker run attempts died on 2026-11-14 — attempt 1 on the
+  /tmp disk-full (fixed operationally by pointing
+  `MAG500_WORKER_VENDOR_ROOT` at disk), attempt 2 killed by an
+  external shutdown ~25 min in. The orchestrator set
+  `MAG500_PREFETCH_CUTOFF` to the run's own start time, so only
+  records written during the current run counted as fresh and every
+  attempt re-evaluated all 503 tickers cold. D-13 adds an opt-in
+  reuse window, `MAG500_PREFETCH_REUSE_HOURS` (float hours;
+  unset/empty/0/invalid/negative = OFF, and with it off behaviour is
+  exactly pre-D-13 everywhere). The window aligns with the vendored
+  engine's own 12h EDGAR cache TTL (`cache_hours=12`).
+  - *Adapter* (`prefetch_valuations`): with reuse on, each ticker's
+    latest history record completed at/after now − window is reused
+    — reported as success with `reused: True` and the existing
+    record's run_id — instead of evaluated, but ONLY when the record
+    passes `_entry_reuse_error`, a mirror of the orchestrator's
+    `reference_validation_error` (same checks, same reason strings:
+    run_id present, status/outcome/audit completion proof,
+    failed-verification markers `persisted.*_verified is False`
+    rejected, finite Business/Value scores, `target_prices` numeric
+    or the D-12 shape). The mirror is a pre-filter; the orchestrator
+    remains the authoritative validator and re-validates everything
+    it loads. Fail-closed names (BRK.B class) write no record, so
+    there is nothing to reuse and they are evaluated normally; a
+    latest in-window record that is invalid is likewise evaluated
+    (fail-safe direction), never reused.
+  - *Orchestrator*: with reuse on, `MAG500_PREFETCH_CUTOFF` becomes
+    now − window (`_prefetch_cutoff` helper) so the Phase 6
+    verify-mode children accept the pre-seeded records as fresh.
+  - *Validation adjustment (the one semantic change)*:
+    `classify_refresh_result` required `verified_ref.run_id !=
+    pre_run_id` — proof the child produced a NEW record. A reused
+    record IS the pre-run record by construction, so every reused
+    ticker would have classified `VALUATION_REFERENCE_NOT_UPDATED`
+    and failed the whole run under D-07 even though reuse worked.
+    The function gains an optional `reuse_cutoff` parameter (None
+    unless reuse is on and the prefetch ran): only when it is set,
+    the child exited 0, and the verified run_id EQUALS the pre-run
+    run_id, the new-record proof is replaced by a freshness proof —
+    the record's completion timestamp must be at/after the same
+    cutoff the child verified against. Nothing else is weakened:
+    `valid_reference` (numeric scores, `target_prices` incl. the
+    D-12 shape, run_id present) is still enforced, timed-out or
+    failed children still fail, a stale same-id record still fails,
+    and with reuse off the new branch never fires.
+  - *Chunk driver* (`scripts/run_prefetch_chunks.py`): splits the
+    universe into chunks (default 100; a trailing remainder folds
+    into the last chunk — 503 → [100, 100, 100, 100, 103]) and runs
+    `prefetch_valuations` per chunk against
+    `data/valuation_history.json`, defaulting
+    `MAG500_PREFETCH_REUSE_HOURS=12` when unset (an explicit env
+    value, including "0", is honoured). Re-running it is safe:
+    already-fresh tickers skip via the same reuse check, so an
+    interrupted chunk costs only its unfinished tickers.
+- **D-14 Structured unscored rows in output rebuild (2026-11-14).**
+  Motivation: the first chunked full run scored 495/503, then died at
+  `output_rebuild` — `RuntimeError: No valid record available for
+  BRK.B` — because the rebuild raised on the first ticker with no
+  valid history record and no prior output record, discarding all 495
+  scored rows, the technical phase, and the Top 2. Approved by
+  BIG SANDY 2026-11-14 ("Yes, build D-14 and finish the run").
+  - *Rule*: in the rebuild loop's no-reference/no-prior-record branch,
+    when this run's refresh for the ticker ran and failed terminally
+    (`d14_unscored_eligible`: refresh exists, not success, error_code
+    is not `VALUATION_REFRESH_TIMEOUT`), the rebuild emits a
+    structured unscored row via `build_unscored_record` — the
+    `build_record` schema with every score null (Business/Value/GAV/
+    derived), `target_prices`/`run_id`/`valuation_last_run_at` null,
+    market fields from this run's market data, `unscored: true`, and
+    `unscored_reason` = the refresh's error message or code. An
+    `output_unscored_row` event is recorded per row. This is the D-17
+    pattern from the options wheel (terminal fail-closed verdict →
+    structured unscored row, reason preserved).
+  - *Still fail-closed*: a timed-out refresh (transient, not a
+    verdict), a missing refresh entry, or any invalid scored record
+    keeps the original raise / validation behaviour. Scored records
+    are untouched — strict reference validation (incl. the D-12
+    target shape) still applies, and Final stays null when any
+    component is missing.
+  - *Never ranked*: unscored rows carry `derived_score: null`; Top-10
+    selection already requires a numeric derived score, so unscored
+    names cannot enter technicals or the Top 2.
+  - *Status unchanged*: D-07 still marks the run FAILED when any
+    refresh failed — D-14 changes what the run PRODUCES (full output,
+    technicals, Top 2), not how it is labelled.
+  - *Tests*: `tests/test_mag50_d14_unscored_rows.py` (8 tests:
+    eligibility gate incl. timeout/missing/success exclusions,
+    unscored schema + null scores, market fields preserved, never
+    ranked, passes output-row validation). Mag suite 53 → 61.

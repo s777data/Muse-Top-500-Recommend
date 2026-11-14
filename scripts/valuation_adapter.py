@@ -61,6 +61,14 @@ Modes:
   Vendored files on disk are never modified. The parent process writes
   history records serially as futures complete; the orchestrator still
   assembles canonical output in input-rank order.
+- D-13 reuse (resumable runs): with ``MAG500_PREFETCH_REUSE_HOURS``
+  > 0, ``prefetch_valuations()`` first checks each ticker's latest
+  history record; a record that (a) completed within the window and
+  (b) passes the same validation the orchestrator applies is reused
+  (reported as success with ``reused: True``) instead of re-evaluated.
+  Unset/0 = reuse off, pre-D-13 behaviour exactly. The window aligns
+  with the vendored engine's own 12h EDGAR cache TTL. See
+  DEVIATIONS.md D-13.
 """
 from __future__ import annotations
 
@@ -69,6 +77,7 @@ import copy
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shutil
 import sys
@@ -77,7 +86,7 @@ import time
 import urllib.request
 import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -440,13 +449,189 @@ def _worker_evaluate(ticker: str) -> tuple[str, dict | None, dict]:
     return (ticker, *evaluate_to_entry(ticker, vendor))
 
 
+# --------------------------------------------------------------------------
+# D-13: resumable prefetch reuse.
+#
+# Two full-run attempts on 2026-11-14 died mid-prefetch (attempt 1:
+# /tmp disk-full; attempt 2: external shutdown ~25 min in). Because the
+# orchestrator's freshness cutoff was the run's own start time, every
+# attempt re-evaluated all 503 tickers cold. With
+# MAG500_PREFETCH_REUSE_HOURS > 0, prefetch reuses a ticker's latest
+# history record when it completed within the window AND would pass
+# the orchestrator's reference validation; anything else is evaluated
+# normally. The window (12h in the chunked driver) matches the vendored
+# engine's own EDGAR cache TTL (cache_hours=12 in the worker fetcher).
+# --------------------------------------------------------------------------
+
+def _prefetch_reuse_hours() -> float:
+    """Reuse window in hours from MAG500_PREFETCH_REUSE_HOURS.
+    Unset/empty/0/invalid/negative = 0.0 (reuse off)."""
+    try:
+        hours = float(os.environ.get("MAG500_PREFETCH_REUSE_HOURS", "") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return hours if hours > 0 else 0.0
+
+
+def _reuse_cutoff_iso(hours: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)) \
+        .isoformat().replace("+00:00", "Z")
+
+
+def _is_finite_number(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _dcf_missing_target_ok(target_prices: Any) -> bool:
+    """Mirror of the orchestrator's D-12 helper (same rule): a
+    target_prices with no numeric target is valid only as the recorded
+    DCF-missing shape — non-empty dcf_missing_reason plus an explicitly
+    null dcf_fair_value."""
+    if not isinstance(target_prices, dict):
+        return False
+    reason = target_prices.get('dcf_missing_reason')
+    return (
+        isinstance(reason, str)
+        and bool(reason.strip())
+        and 'dcf_fair_value' in target_prices
+        and target_prices.get('dcf_fair_value') is None
+    )
+
+
+def _entry_reuse_error(entry: Any) -> str | None:
+    """Would the orchestrator accept this history record? Returns a
+    rejection reason string, or None when the record is reusable.
+
+    This mirrors ``reference_validation_error`` in
+    mag50_auto_orchestrate.py — same checks, same reason strings —
+    including the failed-verification markers (persisted
+    history/audit ``*_verified is False``), completion proof, finite
+    Business/Value scores, and target_prices (numeric target or the
+    D-12 shape). It is a pre-filter only: the orchestrator remains the
+    authoritative validator and re-validates every record it loads,
+    so mirror drift can only cost an evaluation, never an output."""
+    if not isinstance(entry, dict):
+        return 'REFERENCE_NOT_OBJECT'
+    if not str(entry.get('ticker', '')).strip():
+        return 'REFERENCE_TICKER_MISSING'
+    if not isinstance(entry.get('run_id'), str) or not entry['run_id'].strip():
+        return 'RUN_ID_NOT_FOUND'
+
+    outcome = entry.get('outcome')
+    persisted_present = isinstance(entry.get('persisted'), dict)
+    persisted = entry.get('persisted') if persisted_present else {}
+    audit_outcome = persisted.get('audit_outcome')
+    status = entry.get('status')
+    valuation_payload = entry.get('valuation')
+    grade_payload: dict[str, Any] = {}
+    if isinstance(valuation_payload, dict):
+        grade_candidate = valuation_payload.get('grade')
+        if isinstance(grade_candidate, dict):
+            grade_payload = grade_candidate
+    if status is not None and status not in {'ok', 'complete'}:
+        return 'REFERENCE_STATUS_NOT_OK'
+    if grade_payload.get('status') is not None and grade_payload.get('status') != 'ok':
+        return 'REFERENCE_GRADE_STATUS_NOT_OK'
+    if outcome is not None and outcome != 'complete':
+        return 'REFERENCE_OUTCOME_NOT_COMPLETE'
+    if audit_outcome is not None and audit_outcome != 'complete':
+        return 'REFERENCE_AUDIT_NOT_COMPLETE'
+    if persisted.get('history_entry_verified') is False:
+        return 'REFERENCE_HISTORY_NOT_VERIFIED'
+    if persisted.get('audit_record_verified') is False:
+        return 'REFERENCE_AUDIT_NOT_VERIFIED'
+
+    current_history_shape = (
+        outcome is None
+        and audit_outcome is None
+        and not persisted_present
+        and bool(entry.get('data_cutoff_at'))
+        and isinstance(valuation_payload, dict)
+        and grade_payload.get('status') == 'ok'
+    )
+    if outcome != 'complete' and audit_outcome != 'complete' and not current_history_shape:
+        return 'REFERENCE_COMPLETION_UNPROVEN'
+
+    # Score/target extraction mirrors normalize_reference's outcome for
+    # the record shapes this pipeline writes and reads.
+    bq = entry.get('business_quality')
+    if not isinstance(bq, dict):
+        bq = valuation_payload.get('business_quality') if isinstance(valuation_payload, dict) else None
+    if not isinstance(bq, dict):
+        bq = grade_payload.get('business_quality')
+    if not isinstance(bq, dict):
+        bq = {}
+    val_score = valuation_payload.get('score') if isinstance(valuation_payload, dict) else None
+    if not _is_finite_number(val_score):
+        val_score = grade_payload.get('score')
+    if not _is_finite_number(val_score):
+        val_score = entry.get('final_score')
+    if not _is_finite_number(bq.get('score')):
+        return 'BUSINESS_QUALITY_SCORE_INVALID'
+    if not _is_finite_number(val_score):
+        return 'VALUATION_SCORE_INVALID'
+
+    target_prices = entry.get('target_prices')
+    if not isinstance(target_prices, dict):
+        target_prices = valuation_payload.get('target_prices') if isinstance(valuation_payload, dict) else None
+    if not isinstance(target_prices, dict):
+        target_prices = grade_payload.get('target_prices')
+    if not isinstance(target_prices, dict) or not target_prices:
+        return 'TARGET_PRICES_MISSING'
+    readable_targets = [
+        value
+        for key, value in target_prices.items()
+        if key not in {'current', 'price_at_valuation'} and _is_finite_number(value)
+    ]
+    if not readable_targets and not _dcf_missing_target_ok(target_prices):
+        return 'TARGET_PRICES_INVALID'
+    return None
+
+
+def _split_reusable(tickers: list[str], history_path: Path,
+                    reuse_cutoff_iso: str) -> tuple[dict[str, dict], list[str]]:
+    """Partition tickers into (reused results, pending tickers) under
+    D-13. A ticker is reused only when its LATEST in-window record
+    passes _entry_reuse_error; if that record is invalid the ticker is
+    evaluated (fail-safe direction), even if an older in-window record
+    might have passed."""
+    reused: dict[str, dict] = {}
+    pending: list[str] = []
+    for ticker in tickers:
+        entry = find_fresh_entry(history_path, ticker, reuse_cutoff_iso)
+        if entry is not None and _entry_reuse_error(entry) is None:
+            bq = entry.get('business_quality') or {}
+            val = entry.get('valuation') or {}
+            reused[ticker] = {
+                "ticker": ticker,
+                "success": True,
+                "reused": True,
+                "reason": None,
+                "run_id": entry.get("run_id"),
+                "business_100": bq.get("score"),
+                "value_100": val.get("score"),
+                "gav_code": bq.get("gav_code"),
+                "final": entry.get("derived_score", entry.get("final_score")),
+            }
+        else:
+            pending.append(ticker)
+    return reused, pending
+
+
 def prefetch_valuations(tickers: list[str], history_path: Path,
                         workers: int | None = None,
                         on_complete=None) -> dict[str, dict]:
     """Evaluate tickers on a bounded process pool; parent appends
     history records serially as futures complete.
 
-    Returns {ticker: diagnostics} (diagnostics['success'] bool)."""
+    Returns {ticker: diagnostics} (diagnostics['success'] bool).
+    D-13: with MAG500_PREFETCH_REUSE_HOURS > 0, tickers with a valid
+    in-window history record are reported as success with
+    diagnostics['reused'] True and are NOT evaluated."""
     if workers is None:
         workers = int(os.environ.get("MAG500_VALUATION_WORKERS", "4"))
     workers = max(1, min(8, workers))
@@ -456,8 +641,20 @@ def prefetch_valuations(tickers: list[str], history_path: Path,
         str(Path(tempfile.gettempdir()) / "mag500-vendor-workers"))
     limiter_file = str(Path(worker_root) / "sec-rate-limiter.json")
     results: dict[str, dict] = {}
-    if workers <= 1 or len(tickers) <= 1:
+    # D-13: reuse partition. With reuse off, pending == tickers and the
+    # flow below is exactly the pre-D-13 behaviour.
+    pending = list(tickers)
+    reuse_hours = _prefetch_reuse_hours()
+    if reuse_hours > 0:
+        reused, pending = _split_reusable(
+            tickers, history_path, _reuse_cutoff_iso(reuse_hours))
         for ticker in tickers:
+            if ticker in reused:
+                results[ticker] = reused[ticker]
+                if on_complete:
+                    on_complete(ticker, reused[ticker])
+    if workers <= 1 or len(pending) <= 1:
+        for ticker in pending:
             entry, diag = evaluate_to_entry(ticker, VENDOR)
             diag["success"] = entry is not None
             if entry is not None:
@@ -470,7 +667,7 @@ def prefetch_valuations(tickers: list[str], history_path: Path,
     try:
         with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init,
                                  initargs=(worker_root, limiter_file, rate)) as pool:
-            futures = {pool.submit(_worker_evaluate, t): t for t in tickers}
+            futures = {pool.submit(_worker_evaluate, t): t for t in pending}
             for fut in as_completed(futures):
                 ticker = futures[fut]
                 try:

@@ -154,3 +154,95 @@ names.
   CONDITIONAL_BUY); deliveries 5 sent / 0 failed; **exactly 1
   audit record**; terminal status **SUCCESS** (every stage
   succeeded — correct under D-07).
+
+## 2026-11-14 — D-13 applied: resumable valuation reuse
+
+Motivation (see DEVIATIONS.md D-13): two full-run attempts died on
+2026-11-14 (attempt 1: /tmp disk-full, fixed operationally; attempt
+2: external shutdown ~25 min in) and the run-start freshness cutoff
+forced every attempt to re-evaluate all 503 tickers cold. D-13 makes
+valuation work resumable across attempts inside a 12h window (the
+vendored engine's own EDGAR cache TTL), controlled by
+`MAG500_PREFETCH_REUSE_HOURS` (unset/0 = off, pre-D-13 behaviour
+exactly).
+
+### Changes
+- `scripts/valuation_adapter.py`: `prefetch_valuations` partitions
+  tickers via `_split_reusable` when reuse is on — a ticker whose
+  latest in-window history record passes `_entry_reuse_error` (a
+  mirror of the orchestrator's `reference_validation_error`, incl.
+  failed-verification markers and the D-12 target shape) is reported
+  `{success: True, reused: True, run_id: <existing>}` and NOT
+  evaluated; invalid or stale records and record-less fail-closed
+  names are evaluated normally.
+- `skills/mag-500-recommendation/scripts/mag50_auto_orchestrate.py`:
+  `_prefetch_reuse_hours` / `_prefetch_cutoff` helpers; with reuse
+  on, `MAG500_PREFETCH_CUTOFF` = now − window instead of now.
+  Validation adjustment (required, minimal): `classify_refresh_result`
+  demanded a NEW record (`run_id != pre_run_id`), which a reused
+  record can never satisfy — every reused ticker would have failed
+  as `VALUATION_REFERENCE_NOT_UPDATED`. It gains an optional
+  `reuse_cutoff`: only when set, child exit 0, and the verified
+  run_id equals the pre-run run_id, the new-record proof is replaced
+  by a freshness proof (completion timestamp ≥ the cutoff the child
+  verified against). `valid_reference` and all other checks are
+  unchanged; with reuse off the branch never fires.
+- `scripts/run_prefetch_chunks.py` (new): chunked prefetch driver —
+  universe → chunks (default 100, trailing remainder folded into the
+  last chunk: 503 → [100, 100, 100, 100, 103]), per-chunk timing and
+  succeeded/failed/reused counts, `--tickers` / `--offset` /
+  `--limit` overrides, defaults `MAG500_PREFETCH_REUSE_HOURS=12`
+  when unset. Re-running is safe (fresh tickers skip).
+
+### Verification
+- Mag suite: **37 → 53 passed** (16 new tests in
+  `test_mag50_d13_reuse.py`: prefetch reuses fresh valid + fresh
+  D-12 records; stale record evaluated; reuse off/0 evaluates;
+  fresh-but-invalid and failed-verification-marker records
+  evaluated; orchestrator cutoff with/without env; classify
+  same-run-id rejected without reuse, accepted with an in-window
+  cutoff, rejected with a post-completion cutoff, failed child not
+  rescued, new-record path unchanged; chunk split of 503 →
+  [100, 100, 100, 100, 103] + edge cases). Technical suite:
+  **13 passed**. `compileall` clean. Vendor tree untouched.
+- Live proof (rehearsal, /tmp scratch base, Fri 2026-11-13 closes):
+  - Stage 1 — seed with reuse OFF, `prefetch_valuations` on
+    [AAPL, LLY, BRK.B], wall **38.7 s**: AAPL record
+    `MAG500VAL-20261114T224137Z-fa5f92`, LLY record
+    `MAG500VAL-20261114T224137Z-b3cd9d` written; BRK.B fail-closed
+    (`value_score_missing`), NO record. History = 2 records.
+  - Stage 2 — orchestrator end-to-end on the scratch base (input
+    [AAPL, LLY, BRK.B], BRK.B prior-output fixture only) with
+    `MAG500_PREFETCH_REUSE_HOURS=12` and the worker vendor root on
+    disk under the scratch dir, wall **107.9 s** (run
+    `MAG500-20261114T224145Z-b0117a`; most of the wall is BRK.B's
+    three real attempts with 30 s/60 s backoff). Evidence of reuse,
+    not re-evaluation: prefetch reported AAPL/LLY success with the
+    STAGE-1 run_ids; the Phase 6 children printed
+    `{"prefetched": true, "run_id": <stage-1 id>}` and exited in
+    0.14 s / 0.17 s (vs ~19 s per real evaluation in stage 1);
+    refresh classification AAPL/LLY success with pre_run_id ==
+    new_run_id == stage-1 id (the D-13 classify path); history
+    still exactly 2 records afterwards (nothing re-appended);
+    canonical output carries the stage-1 run_ids (AAPL Final
+    52.275, LLY Final 37.625) and the labelled fixture prior for
+    BRK.B. BRK.B was evaluated fresh in both prefetch and Phase 6
+    and failed closed (`value_score_missing`, 3 attempts) as
+    before. **Exactly 1 audit record; terminal status FAILED** —
+    attributable solely to the BRK.B refresh failure, as designed.
+- No GitHub push, no Space changes, no full 503 run (per tasking).
+
+## 2026-11-14 — D-14 applied: unscored rows in output rebuild
+
+- Chunked full run MAG500-20261114T224829Z-3c5090 (Stage A pre-seed
+  189.2 s: 495 succeeded / 445 reused / 50 fresh; Stage B 17 m 53 s)
+  FAILED at `output_rebuild` on BRK.B despite 495/503 scored —
+  motivation for D-14 (see DEVIATIONS.md). Exactly 1 audit record;
+  no output file written; technicals never ran.
+- Fix in `skills/mag-500-recommendation/scripts/mag50_auto_orchestrate.py`:
+  new `d14_unscored_eligible()` gate + `build_unscored_record()`
+  helper; the rebuild's raise branch now emits an unscored row for
+  terminal refresh failures (timeouts and missing refreshes still
+  raise). Vendor tree untouched (19/19 SHA-256 re-verified).
+- Tests: mag suite 53 → 61 passed (8 new D-14 tests), technical
+  suite 13 passed, compileall clean.
